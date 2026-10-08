@@ -199,7 +199,7 @@ class TrackingController:
     def calculate_acceptable_box(self, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
         box_w = int(frame_w * self.acceptable_ratio)
         box_h = int(frame_h * self.acceptable_ratio)
-        cx, cy = frame_w // 2, frame_h // 2
+        cx, cy = frame_w // 2, frame_h // 3
         return cx - box_w // 2, cy - box_h // 2, cx + box_w // 2, cy + box_h // 2
 
     def _status(self, box: Tuple[int, int, int, int], now: float, observation_time: float) -> ControllerStatus:
@@ -245,7 +245,7 @@ class TrackingController:
 
             box = self.calculate_acceptable_box(frame_w, frame_h)
             left, top, right, bottom = box
-            frame_cx, frame_cy = frame_w // 2, frame_h // 2
+            frame_cx, frame_cy = frame_w // 2, frame_h // 4
             status = self._status(box, now, observed_at)
 
             if not self.enabled:
@@ -361,7 +361,12 @@ class TrackingController:
             excess_x = max(0, abs(err_x) - half_deadband_x)
             excess_y = max(0, abs(err_y) - half_deadband_y)
             norm_x = excess_x / max(1, frame_cx - half_deadband_x)
-            norm_y = excess_y / max(1, frame_cy - half_deadband_y)
+            vertical_range = (
+                frame_h - frame_cy - half_deadband_y
+                if err_y > 0
+                else frame_cy - half_deadband_y
+            )
+            norm_y = excess_y / max(1, vertical_range)
 
             use_base = desired_azimuth != 0 and (
                 desired_altitude == 0 or norm_x >= norm_y or self.pitch_limits is None
