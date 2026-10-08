@@ -10,6 +10,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 from loguru import logger
+try:
+    from .operator_faults import OperatorFaultLog
+except ImportError:
+    from operator_faults import OperatorFaultLog
 
 
 # ICD Command IDs from commander/src/icd_config.py
@@ -64,6 +68,8 @@ class OperatorClient:
         self._message_listeners: list[Callable[[str], None]] = []
         self._fault_lock = threading.Lock()
         self._fault_message: Optional[str] = None
+        self._fault_log = OperatorFaultLog()
+        self._fault_thread = None
 
         if auto_connect:
             self.start()
@@ -75,6 +81,15 @@ class OperatorClient:
         self.is_running = True
         self._recv_thread = threading.Thread(target=self._connection_loop, daemon=True, name="OperatorClientThread")
         self._recv_thread.start()
+        if self.host in ("127.0.0.1", "localhost", "::1"):
+            self._fault_thread = threading.Thread(target=self._watch_fault_log, daemon=True, name="OperatorFaultLog")
+            self._fault_thread.start()
+
+    def _watch_fault_log(self):
+        while self.is_running:
+            for fault in self._fault_log.poll():
+                self._handle_telemetry_line("FAULT " + fault)
+            time.sleep(.25)
 
     def stop(self):
         """Closes connection and stops thread."""
@@ -242,6 +257,10 @@ class OperatorClient:
         """
         payload = struct.pack("bb", int(moving_azimuth), int(moving_altitude))
         return self.send_command(ICDCommand.POLAR_PAN_CONTINUOUS_START, payload)
+
+    def tracking_jog_start(self, azimuth: int, altitude: int, interval_ms: int) -> bool:
+        """Set Pi-local tracking direction and serial jog cadence without exiting manual mode."""
+        return self.execute_hardware_operation(0x06, struct.pack("bbB", azimuth, altitude, interval_ms))
 
     def polar_pan_continuous_stop(self) -> bool:
         """Stops continuous polar pan movement."""

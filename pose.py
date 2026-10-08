@@ -7,6 +7,7 @@ recognition or any network service.
 from __future__ import annotations
 
 from os import path
+import os
 from typing import List
 
 import cv2
@@ -20,17 +21,20 @@ except ImportError:
 
 
 class PoseDetector:
-    """YOLO11n-pose ONNX, fixed 320x320 RGB / 0..1 input, output [1,56,2100]."""
+    """YOLO11 COCO pose ONNX; input resolution is read from the exported model."""
     def __init__(self, model_weights: str, conf_thresh: float = 0.35, keypoint_thresh: float = 0.30) -> None:
         if not path.exists(model_weights):
             raise RuntimeError(f"pose model missing: {model_weights}")
         self.conf_thresh, self.keypoint_thresh = conf_thresh, keypoint_thresh
-        options = ort.SessionOptions(); options.intra_op_num_threads = 4
+        options = ort.SessionOptions(); options.intra_op_num_threads = int(os.getenv("POSE_THREADS", "4"))
+        options.add_session_config_entry("session.intra_op.allow_spinning", os.getenv("POSE_SPINNING", "0"))
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(model_weights, sess_options=options, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape
+        if len(shape) != 4 or shape[:2] != [1, 3] or any(not isinstance(v, int) or v <= 0 for v in shape[2:]):
+            raise RuntimeError("pose model must have fixed [1,3,height,width] input; export with dynamic=False")
         self.infer_size = (int(shape[3]), int(shape[2]))
         self.healthy, self.last_error = True, None
 
@@ -47,7 +51,11 @@ class PoseDetector:
         except Exception as error:
             self.healthy, self.last_error = False, str(error)
             raise RuntimeError(f"pose inference failed: {error}") from error
-        rows = raw[0].T if raw.ndim == 3 and raw.shape[1] == 56 else raw.reshape(-1, 56)
+        if raw.ndim != 3 or raw.shape[0] != 1 or raw.shape[1] != 56:
+            self.healthy, self.last_error = False, "expected COCO pose output [1,56,N]"
+            raise RuntimeError(self.last_error)
+        rows = raw[0].T
+        rows = rows[rows[:, 4] >= self.conf_thresh]  # Avoid a Python loop over thousands of rejected anchors.
         boxes, scores, candidates = [], [], []
         for row in rows:
             score = float(row[4])

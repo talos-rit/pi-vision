@@ -22,6 +22,10 @@ try:
     from .pose import PoseDetector
     from .operator_client import OperatorClient
     from .web_server import create_app
+    from .perception import PerceptionStore, PerceptionOnlyOperator
+    from .capture import FFmpegCapture
+    from .control_api import ControlLease
+    from .motion_compensation import compensate
 except ImportError:
     from config import CONFIG
     from controller import ControllerStatus, TrackingController
@@ -29,6 +33,10 @@ except ImportError:
     from pose import PoseDetector
     from operator_client import OperatorClient
     from web_server import create_app
+    from perception import PerceptionStore, PerceptionOnlyOperator
+    from capture import FFmpegCapture
+    from control_api import ControlLease
+    from motion_compensation import compensate
 
 
 @dataclass(frozen=True)
@@ -41,8 +49,10 @@ class FrameSample:
 class CameraStream:
     """Threaded camera capture to ensure zero frame-buffering lag with RTSP or V4L2."""
 
-    def __init__(self, src: str):
+    def __init__(self, src: str, backend: str = "opencv"):
         self.src = src
+        self.backend = backend
+        self.active_backend = backend
         self.cap: Optional[cv2.VideoCapture] = None
         self.latest_frame: Optional[np.ndarray] = None
         self.latest_sequence = 0
@@ -82,12 +92,22 @@ class CameraStream:
             )
 
     def _capture_loop(self):
-        # Force FFmpeg RTSP to operate in zero-latency mode: discard all queued frames!
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;0|probesize;32"
+        # Drain capture continuously. TCP avoids lost H.264 reference frames;
+        # a tiny probe size can also prevent reliable decoder initialization.
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0")
         logger.info(f"[Camera] Opening zero-latency video capture from: {self.src}")
         while self.is_running:
             source = int(self.src) if str(self.src).isdigit() else self.src
-            self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if self.backend == "ffmpeg-hardware" and str(source).startswith("rtsp://"):
+                self.cap = FFmpegCapture(source)
+                self.active_backend = "ffmpeg/h264_v4l2m2m"
+            elif isinstance(source, int):
+                self.cap = cv2.VideoCapture(source, cv2.CAP_ANY)
+            else:
+                parameters = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000]
+                if hasattr(cv2, "CAP_PROP_N_THREADS"):
+                    parameters += [cv2.CAP_PROP_N_THREADS, 1]
+                self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, parameters)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not self.cap.isOpened():
@@ -147,7 +167,15 @@ def main():
     parser.add_argument("--port", type=int, default=CONFIG.web_port, help="Web UI port")
     parser.add_argument("--host", default=CONFIG.web_host, help="Web UI host")
     parser.add_argument("--auto-start", action="store_true", help="Start tracking automatically on launch")
+    parser.add_argument("--standalone-control", action="store_true", help="Explicit legacy mode: PiVision owns robot control instead of Commander")
+    parser.add_argument("--edge-control", action="store_true", help="Pi-local tracking with an expiring Commander control lease")
+    parser.add_argument("--capture-backend", choices=("opencv", "ffmpeg-hardware"), default=os.getenv("CAMERA_BACKEND", "opencv"))
     args = parser.parse_args()
+    if args.edge_control and args.standalone_control:
+        parser.error("choose edge control or standalone control")
+    cv2.setNumThreads(1)  # Reserve cores for ONNX; OpenCV preprocessing is small.
+    if args.auto_start and not args.standalone_control:
+        parser.error("--auto-start requires --standalone-control; integrated mode is controlled by Commander")
 
     logger.info("==========================================")
     logger.info("   TALOS Raspberry Pi Edge Tracker")
@@ -158,9 +186,11 @@ def main():
     pose_tuning = PoseTuning()
     pose_lock = threading.Lock()
 
-    camera = CameraStream(args.camera)
+    camera = CameraStream(args.camera, backend=args.capture_backend)
     camera.start()
-    operator = OperatorClient(host=args.operator_host, port=args.operator_port, auto_connect=True)
+    operator = (OperatorClient(host=args.operator_host, port=args.operator_port, auto_connect=True)
+                if args.standalone_control or args.edge_control else PerceptionOnlyOperator())
+    perception = PerceptionStore()
 
     # 4. Initialize Closed Loop Controller
     controller = TrackingController(
@@ -180,10 +210,12 @@ def main():
         max_base_pulse=CONFIG.max_base_pulse_s,
         max_pitch_pulse=CONFIG.max_pitch_pulse_s,
         speed_percent=CONFIG.default_speed_percent,
+        continuous_tracking=True,
     )
 
     if args.auto_start:
         controller.set_enabled(True)
+    control_lease = ControlLease(controller, operator) if args.edge_control else None
 
     # Shared state between tracking thread and web server
     latest_status = ControllerStatus()
@@ -197,6 +229,8 @@ def main():
     def motion_service_worker():
         interval = 1.0 / CONFIG.control_rate_hz
         while True:
+            if control_lease:
+                control_lease.service()
             controller.service_motion()
             time.sleep(interval)
 
@@ -214,6 +248,9 @@ def main():
         logger.info("[Tracker] Latest-frame inference loop started (no frame queue).")
 
         while True:
+            if not perception.enabled:
+                time.sleep(0.02)
+                continue
             sample = camera.get_latest_sample(after_sequence=last_sequence)
             if sample is not None:
                 last_sequence = sample.sequence
@@ -225,6 +262,7 @@ def main():
                 detector.conf_thresh = tuning.person_confidence
 
                 try:
+                    inference_started = time.monotonic()
                     roi_detections = detector.detect(roi_frame)
                     detections = [Detection((item.box[0] + rx, item.box[1] + ry, item.box[2] + rx, item.box[3] + ry), item.confidence, item.class_id, item.class_name, (item.aim_point[0] + rx, item.aim_point[1] + ry) if item.aim_point else None, tuple((x + rx, y + ry, score) for x, y, score in item.keypoints) if item.keypoints else None) for item in roi_detections]
                 except RuntimeError as error:
@@ -240,12 +278,25 @@ def main():
                     logger.exception("[Tracker] Detector failed; autonomous motion disabled.")
                     return
 
+                inference_s = time.monotonic() - inference_started
+                control_sample = sample
+                compensated = False
+                newest = camera.get_latest_sample(after_sequence=sample.sequence)
+                if newest is not None and newest.captured_monotonic - sample.captured_monotonic <= .5:
+                    try:
+                        aligned = compensate(sample.frame, newest.frame, detections)
+                    except cv2.error:
+                        aligned = None
+                    if aligned is not None:
+                        detections, control_sample, compensated = aligned, newest, True
+                perception.publish(control_sample, detections, inference_s,
+                                   pose_captured=sample.captured_monotonic, motion_compensated=compensated)
                 status = controller.update(
                     w,
                     h,
                     detections,
-                    observation_time=sample.captured_monotonic,
-                    observation_seq=sample.sequence,
+                    observation_time=control_sample.captured_monotonic,
+                    observation_seq=control_sample.sequence,
                 )
 
                 # Track FPS
@@ -256,6 +307,11 @@ def main():
                     fps_start = time.monotonic()
 
                 status.fps = current_fps
+                if not controller.enabled and detections:
+                    target = max(detections, key=lambda item: item.confidence)
+                    status.target_box, status.target_center = target.box, target.center
+                    status.target_confidence, status.target_keypoints = target.confidence, target.keypoints
+                    # Pose overlays stay visible while motion is disabled.
 
                 with status_lock:
                     latest_status = status
@@ -274,6 +330,9 @@ def main():
         get_latest_status=get_latest_status_snapshot,
         get_pose_tuning=lambda: pose_tuning.__dict__.copy(),
         update_pose_tuning=lambda values: _update_pose_tuning(pose_tuning, pose_lock, values),
+        perception=perception,
+        standalone_control=args.standalone_control,
+        control_lease=control_lease,
     )
 
     logger.info(f"[WebUI] Starting Web UI on http://{args.host}:{args.port}")
