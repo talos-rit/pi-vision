@@ -46,7 +46,7 @@ class TrackerConfig:
     enable_joint_limits: bool = True
     base_min_count: int = -5000
     base_max_count: int = 5000
-    # Pitch tracking stays inhibited until physically verified limits are supplied.
+    # Optional extra count limits; pitch uses Operator's existing wrist-pitch path.
     pitch_min_count: int | None = _optional_int("PITCH_MIN_COUNT")
     pitch_max_count: int | None = _optional_int("PITCH_MAX_COUNT")
     

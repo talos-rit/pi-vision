@@ -1,8 +1,8 @@
 """Fresh-observation visual servo controller for Bingo.
 
 The ER-V cannot provide joint telemetry while its ACL manual-motion path is active.
-Tracking therefore uses short, bounded pulses and requires both a newer camera frame
-and post-stop joint telemetry before issuing the next pulse. A high-rate caller must
+Tracking uses short, bounded pulses, a settling interval and a newer camera frame
+before issuing the next pulse. Joint telemetry is optional feedback. A high-rate caller must
 invoke :meth:`service_motion` so stopping never waits for inference to finish.
 """
 
@@ -57,7 +57,7 @@ class ControllerStatus:
 
 
 class TrackingController:
-    """Thread-safe, pulse-and-observe controller for visual tracking."""
+    """Thread-safe Pi-local visual following, with legacy pulse mode support."""
 
     def __init__(
         self,
@@ -75,6 +75,7 @@ class TrackingController:
         max_base_pulse: float = 0.16,
         max_pitch_pulse: float = 0.09,
         speed_percent: int = 20,
+        continuous_tracking: bool = False,
     ):
         if not 0.0 < acceptable_ratio < 1.0:
             raise ValueError("acceptable_ratio must be between zero and one")
@@ -96,6 +97,11 @@ class TrackingController:
         self.max_base_pulse = max_base_pulse
         self.max_pitch_pulse = max_pitch_pulse
         self.speed_percent = max(1, min(100, speed_percent))
+        self.continuous_tracking = continuous_tracking
+        self.last_motion_refresh = 0.0
+        self.current_jog_interval_ms = 10
+        self._target_sample = None
+        self._target_velocity = (0.0, 0.0)
 
         self.enabled = False
         self.state = TrackingState.DISABLED
@@ -133,7 +139,6 @@ class TrackingController:
 
             if self.enabled:
                 return True
-            now = time.monotonic()
             fault = self.operator.get_fault()
             if fault:
                 self.state = TrackingState.FAULT
@@ -156,6 +161,8 @@ class TrackingController:
             self.state = TrackingState.SEARCHING
             self.last_thought = "Tracking enabled. Waiting for a fresh person detection."
             self.tracked_target_center = None
+            self._target_sample = None
+            self._target_velocity = (0.0, 0.0)
             self._log(f"Autonomous tracking ENABLED at {self.speed_percent}% speed.")
             return True
 
@@ -182,25 +189,43 @@ class TrackingController:
         self.current_altitude = 0
         self.pulse_deadline = 0.0
         self.last_motion_stop_time = stopped_at
+        if self.continuous_tracking:
+            self._target_sample = None
+            self._target_velocity = (0.0, 0.0)
         if reason:
             self._log(f"Motion stopped ({reason}).")
 
     def service_motion(self, now: Optional[float] = None) -> None:
-        """Enforce pulse and stale-observation deadlines independently of inference."""
+        """Finish an accepted bounded pulse independently of inference."""
         current = time.monotonic() if now is None else now
         with self._lock:
             if not self.is_currently_moving:
                 return
+            if self.continuous_tracking:
+                if self.operator.get_fault() or not self.operator.is_connected:
+                    self._stop_movement_locked("Operator unavailable or controller fault", current)
+                elif current - self.last_observation_time > self.max_observation_age + 0.3:
+                    self._stop_movement_locked("camera updates stopped", current)
+                elif current - self.last_motion_refresh >= 0.15:
+                    if self._send_tracking_direction(self.current_azimuth, self.current_altitude):
+                        self.last_motion_refresh = current
+                    else:
+                        self._stop_movement_locked("Operator rejected motion refresh", current)
+                return
             if current >= self.pulse_deadline:
                 self._stop_movement_locked("pulse complete", current)
-            elif current - self.last_observation_time > self.max_observation_age:
-                self._stop_movement_locked("camera observation became stale", current)
 
     def calculate_acceptable_box(self, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
         box_w = int(frame_w * self.acceptable_ratio)
         box_h = int(frame_h * self.acceptable_ratio)
         cx, cy = frame_w // 2, frame_h // 2
         return cx - box_w // 2, cy - box_h // 2, cx + box_w // 2, cy + box_h // 2
+
+    def set_acceptable_ratio(self, ratio: float) -> None:
+        if type(ratio) not in (int, float) or not 0.05 <= ratio <= 0.8:
+            raise ValueError("centering tolerance must be 0.05..0.8")
+        with self._lock:
+            self.acceptable_ratio = float(ratio)
 
     def _status(self, box: Tuple[int, int, int, int], now: float, observation_time: float) -> ControllerStatus:
         telemetry = self.operator.get_telemetry()
@@ -262,9 +287,12 @@ class TrackingController:
             self.last_observation_time = observed_at
 
             observation_age = now - observed_at
-            if observation_age > self.max_observation_age:
+            # Continuous following must allow the measured ~230 ms inference
+            # time as well as capture delay, matching the refresh-loop timeout.
+            observation_budget = self.max_observation_age + (0.3 if self.continuous_tracking else 0.0)
+            if observation_age > observation_budget:
                 self._stop_movement_locked("stale camera frame", now)
-                self.state = TrackingState.SEARCHING
+                self.state = TrackingState.WAITING_FEEDBACK
                 self.last_thought = f"Camera frame is stale ({observation_age:.2f}s); motion inhibited."
                 status.state = self.state
                 status.last_thought = self.last_thought
@@ -294,11 +322,12 @@ class TrackingController:
                 self._mark_status_stopped(status)
                 return status
 
-            # Telemetry is informational for pacing, but still supplies the
-            # conservative base-limit check when it happens to be available.
             telemetry = self.operator.get_telemetry()
+            measured_limits_available = telemetry.is_fresh(self.telemetry_timeout, now)
 
             if not detections:
+                self._target_sample = None
+                self._target_velocity = (0.0, 0.0)
                 self._stop_movement_locked("no person in newest frame", now)
                 if self.last_target_time and now - self.last_target_time <= self.target_lost_timeout:
                     self.last_thought = "Target absent in newest frame; holding immediately."
@@ -324,8 +353,31 @@ class TrackingController:
             status.error_x = err_x
             status.error_y = err_y
 
-            inside_x = left <= tx <= right
-            inside_y = top <= ty <= bottom
+            aim_x, aim_y = tx, ty
+            if self.continuous_tracking:
+                if self._target_sample is not None:
+                    previous_x, previous_y, previous_time = self._target_sample
+                    dt = observed_at - previous_time
+                    if .05 <= dt <= 1.0:
+                        vx = max(-frame_w, min(frame_w, (tx - previous_x) / dt))
+                        vy = max(-frame_h, min(frame_h, (ty - previous_y) / dt))
+                        self._target_velocity = (.5 * self._target_velocity[0] + .5 * vx,
+                                                 .5 * self._target_velocity[1] + .5 * vy)
+                    else:
+                        self._target_velocity = (0.0, 0.0)
+                self._target_sample = (tx, ty, observed_at)
+                lookahead = min(.5, observation_age + .08)
+                aim_x += self._target_velocity[0] * lookahead
+                aim_y += self._target_velocity[1] * lookahead
+            if self.continuous_tracking and self.state == TrackingState.CENTERED:
+                margin_x, margin_y = frame_w * .025, frame_h * .04
+                if left - margin_x <= tx <= right + margin_x and top - margin_y <= ty <= bottom + margin_y:
+                    status.state = TrackingState.CENTERED
+                    status.current_command = "HOLDING (ON TARGET)"
+                    self._mark_status_stopped(status)
+                    return status
+            inside_x = left <= aim_x <= right or (self.continuous_tracking and err_x * (aim_x - frame_cx) <= 0)
+            inside_y = top <= aim_y <= bottom or (self.continuous_tracking and err_y * (aim_y - frame_cy) <= 0)
             if inside_x and inside_y:
                 self._stop_movement_locked("target entered deadband", now)
                 self.state = TrackingState.CENTERED
@@ -336,10 +388,10 @@ class TrackingController:
                 self._mark_status_stopped(status)
                 return status
 
-            desired_azimuth = 0 if inside_x else (1 if err_x > 0 else -1)
-            desired_altitude = 0 if inside_y else (-1 if err_y > 0 else 1)
+            desired_azimuth = 0 if inside_x else (1 if aim_x > frame_cx else -1)
+            desired_altitude = 0 if inside_y else (-1 if aim_y > frame_cy else 1)
 
-            if self.is_currently_moving:
+            if self.is_currently_moving and not self.continuous_tracking:
                 reversed_direction = (
                     (self.current_azimuth and desired_azimuth != self.current_azimuth)
                     or (self.current_altitude and desired_altitude != self.current_altitude)
@@ -354,54 +406,61 @@ class TrackingController:
                 status.last_thought = self.last_thought
                 return status
 
-            # Camera observations, not slow controller telemetry, pace bounded tracking pulses.
+            # Pace corrections from camera feedback and a settling interval.
+            # Optional serial telemetry must not gate the next visual correction.
+            if not self.continuous_tracking and self.last_motion_stop_time and (
+                now - self.last_motion_stop_time < self.settle_time
+                or observed_at <= self.last_motion_stop_time
+            ):
+                self.state = TrackingState.WAITING_FEEDBACK
+                status.state = self.state
+                self.last_thought = "Waiting for settling and a newer camera frame."
+                status.last_thought = self.last_thought
+                self._mark_status_stopped(status)
+                return status
 
             half_deadband_x = max(1, (right - left) // 2)
             half_deadband_y = max(1, (bottom - top) // 2)
-            excess_x = max(0, abs(err_x) - half_deadband_x)
-            excess_y = max(0, abs(err_y) - half_deadband_y)
+            excess_x = max(0, abs(aim_x - frame_cx) - half_deadband_x)
+            excess_y = max(0, abs(aim_y - frame_cy) - half_deadband_y)
             norm_x = excess_x / max(1, frame_cx - half_deadband_x)
             norm_y = excess_y / max(1, frame_cy - half_deadband_y)
 
             use_base = desired_azimuth != 0 and (
-                desired_altitude == 0 or norm_x >= norm_y or self.pitch_limits is None
+                desired_altitude == 0 or norm_x >= norm_y
             )
             if use_base:
-                if self.enable_joint_limits and (
+                if self.enable_joint_limits and measured_limits_available and (
                     (desired_azimuth > 0 and telemetry.base >= self.base_max)
                     or (desired_azimuth < 0 and telemetry.base <= self.base_min)
                 ):
                     return self._limit_status(status, f"base count {telemetry.base}")
                 pulse = self.min_pulse + (self.max_base_pulse - self.min_pulse) * min(1.0, norm_x)
+                self.current_jog_interval_ms = self.jog_interval("base", norm_x)
                 if not self._start_pulse(desired_azimuth, 0, pulse, now):
                     return self._fault_status(status, "Operator rejected tracking motion command")
             else:
-                if self.pitch_limits is None:
-                    self.state = TrackingState.CENTERED
-                    self.last_thought = "Vertical correction unavailable; holding base position."
-                    status.state = self.state
-                    status.last_thought = self.last_thought
-                    status.current_command = "HOLDING (PITCH UNCALIBRATED)"
-                    self._mark_status_stopped(status)
-                    return status
-                pitch_min, pitch_max = self.pitch_limits
-                if self.enable_joint_limits and (
-                    (desired_altitude > 0 and telemetry.wrist_pitch >= pitch_max)
-                    or (desired_altitude < 0 and telemetry.wrist_pitch <= pitch_min)
-                ):
-                    return self._limit_status(status, f"pitch count {telemetry.wrist_pitch}")
+                # Optional additional count limits do not disable the existing
+                # Operator wrist-pitch path when no custom limits were supplied.
+                if self.enable_joint_limits and measured_limits_available and self.pitch_limits is not None:
+                    pitch_min, pitch_max = self.pitch_limits
+                    if ((desired_altitude > 0 and telemetry.wrist_pitch >= pitch_max)
+                            or (desired_altitude < 0 and telemetry.wrist_pitch <= pitch_min)):
+                        return self._limit_status(status, f"pitch count {telemetry.wrist_pitch}")
                 pulse = self.min_pitch_pulse + (self.max_pitch_pulse - self.min_pitch_pulse) * min(1.0, norm_y)
+                self.current_jog_interval_ms = self.jog_interval("pitch", norm_y)
                 if not self._start_pulse(0, desired_altitude, pulse, now):
                     return self._fault_status(status, "Operator rejected tracking motion command")
 
             self.state = TrackingState.TRACKING
-            self.last_thought = f"Bounded {pulse * 1000:.0f}ms correction from fresh frame (dX={err_x}, dY={err_y})."
+            self.last_thought = (f"Following target (dX={err_x}, dY={err_y})." if self.continuous_tracking
+                                 else f"Bounded {pulse * 1000:.0f}ms correction from fresh frame (dX={err_x}, dY={err_y}).")
             status.state = self.state
             status.last_thought = self.last_thought
-            status.current_command = f"PULSE {pulse * 1000:.0f}ms"
+            status.current_command = "FOLLOW" if self.continuous_tracking else f"PULSE {pulse * 1000:.0f}ms"
             status.moving_azimuth = self.current_azimuth
             status.moving_altitude = self.current_altitude
-            status.pulse_remaining_s = pulse
+            status.pulse_remaining_s = 0.0 if self.continuous_tracking else pulse
             return status
 
     def _select_target(self, detections: List[Detection], now: float) -> Detection:
@@ -417,16 +476,28 @@ class TrackingController:
                 return close[0]
         return detections[0]
 
+    @staticmethod
+    def jog_interval(axis: str, normalized_error: float) -> int:
+        rate = 5 + (55 if axis == "base" else 5) * min(1.0, max(0.0, normalized_error))
+        return max(10, min(200, round(1000 / rate)))
+
+    def _send_tracking_direction(self, azimuth: int, altitude: int) -> bool:
+        if self.continuous_tracking:
+            return self.operator.tracking_jog_start(azimuth, altitude, self.current_jog_interval_ms)
+        return self.operator.polar_pan_continuous_start(azimuth, altitude)
+
     def _start_pulse(self, azimuth: int, altitude: int, duration: float, now: float) -> bool:
-        if not self.operator.polar_pan_continuous_start(azimuth, altitude):
+        if not self._send_tracking_direction(azimuth, altitude):
             return False
         self.is_currently_moving = True
         self.current_azimuth = azimuth
         self.current_altitude = altitude
-        self.pulse_deadline = now + duration
+        self.pulse_deadline = 0.0 if self.continuous_tracking else now + duration
+        self.last_motion_refresh = now
         axis = "base" if azimuth else "pitch"
         direction = azimuth if azimuth else altitude
-        self._log(f"Started {duration * 1000:.0f}ms {axis} pulse, direction={direction}.")
+        self._log(f"Following {axis}, direction={direction}." if self.continuous_tracking
+                  else f"Started {duration * 1000:.0f}ms {axis} pulse, direction={direction}.")
         return True
 
     def _limit_status(self, status: ControllerStatus, reason: str) -> ControllerStatus:

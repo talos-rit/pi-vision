@@ -29,6 +29,9 @@ def create_app(
     get_latest_status: callable,
     get_pose_tuning=None,
     update_pose_tuning=None,
+    perception=None,
+    standalone_control=False,
+    control_lease=None,
 ) -> FastAPI:
     app = FastAPI(title="TALOS Pi Edge Tracker")
 
@@ -173,6 +176,8 @@ def create_app(
         }
         payload["pose"] = {"available": bool(getattr(detector, "healthy", False)), "input": getattr(detector, "infer_size", None)}
         payload["pose_tuning"] = get_pose_tuning() if get_pose_tuning else {}
+        payload["control_owner"] = "pivision-edge" if control_lease else "pivision-standalone" if standalone_control else "commander"
+        payload["edge_control"] = control_lease.status() if control_lease else None
         return JSONResponse(payload)
 
     @app.post("/api/pose/tuning")
@@ -184,8 +189,69 @@ def create_app(
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
+    @app.get("/api/v1/observations")
+    def observations():
+        if perception is None:
+            raise HTTPException(status_code=503, detail="perception not initialized")
+        return perception.snapshot()
+
+    @app.put("/api/v1/perception")
+    def set_perception(payload: dict):
+        if perception is None:
+            raise HTTPException(status_code=503, detail="perception not initialized")
+        if set(payload) != {"enabled"} or type(payload["enabled"]) is not bool:
+            raise HTTPException(status_code=422, detail="expected a boolean enabled field")
+        if not payload["enabled"] and control_lease:
+            control_lease.revoke()
+        return perception.set_enabled(payload["enabled"])
+
+    @app.get("/api/v1/control/status")
+    def edge_status():
+        if control_lease is None:
+            raise HTTPException(409, "start PiVision with --edge-control")
+        control_lease.service()
+        return control_lease.status()
+
+    @app.put("/api/v1/control/lease")
+    def control_lease_update(payload: dict):
+        if control_lease is None:
+            raise HTTPException(409, "start PiVision with --edge-control")
+        if payload.get("enabled") is True and payload.get("renew") is not True:
+            speed, age = payload.get("speed_percent", 20), payload.get("max_observation_age_s", 0.35)
+            if type(speed) is not int or not 1 <= speed <= 100 or type(age) not in (int, float) or not 0.05 <= age <= 1.0:
+                raise HTTPException(422, "speed must be 1..100 and observation age 0.05..1.0 seconds")
+            if control_lease.owner is None:
+                controller.speed_percent, controller.max_observation_age = speed, age
+                if "acceptable_ratio" in payload:
+                    control_lease.tune(payload.get("owner"), payload["acceptable_ratio"])
+        return control_lease.update(payload.get("owner"), payload.get("enabled"), payload.get("renew") is True)
+
+    @app.put("/api/v1/control/tuning")
+    def control_tuning(payload: dict):
+        if control_lease is None:
+            raise HTTPException(409, "start PiVision with --edge-control")
+        return control_lease.tune(payload.get("owner"), payload.get("acceptable_ratio"))
+
+    @app.post("/api/v1/control/commands")
+    def manual_edge_command(payload: dict):
+        if control_lease is None:
+            raise HTTPException(409, "start PiVision with --edge-control")
+        try:
+            command = payload["command"]
+            if type(command) is not int:
+                raise ValueError("command must be an integer")
+            packet = bytes.fromhex(payload["payload_hex"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(422, str(error)) from error
+        return control_lease.manual_command(command, packet)
+
+    def require_standalone():
+        if not standalone_control:
+            raise HTTPException(status_code=409, detail="PiVision is perception-only; control the robot through Commander")
+
     @app.post("/api/tracking/enable")
     def enable_tracking():
+        require_standalone()
         if not controller.set_enabled(True):
             raise HTTPException(status_code=409, detail=controller.last_thought)
         return {"status": "ok", "tracking_enabled": True}
@@ -197,6 +263,7 @@ def create_app(
 
     @app.post("/api/tracking/toggle")
     def toggle_tracking():
+        require_standalone()
         new_state = not controller.enabled
         if not controller.set_enabled(new_state):
             raise HTTPException(status_code=409, detail=controller.last_thought)
@@ -209,6 +276,7 @@ def create_app(
 
     @app.post("/api/command/home")
     def home_robot():
+        require_standalone()
         controller.stop_movement("Homing requested")
         controller.set_enabled(False)
         success = operator.home(delay_ms=0)
@@ -216,12 +284,14 @@ def create_app(
 
     @app.post("/api/command/enable_control")
     def enable_control():
+        require_standalone()
         controller.set_enabled(False)
         success = operator.clear_fault()
         return {"status": "ok" if success else "failed", "control_enable_requested": success}
 
     @app.post("/api/command/set_speed")
     def set_speed(percent: int = 20):
+        require_standalone()
         if controller.enabled:
             raise HTTPException(status_code=409, detail="disable tracking before changing controller speed")
         success = operator.erv_set_speed_percent(percent)
