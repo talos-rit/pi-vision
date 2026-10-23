@@ -279,6 +279,17 @@ class OperatorClient:
         body = struct.pack(">BI", subcommand, 0) + payload
         return self.send_command(ICDCommand.EXECUTE_HARDWARE_OPERATION, body)
 
+    def joint_jog_start(self, axis: int, direction: int) -> bool:
+        """Hold an ER-V shoulder (axis 2) or elbow (axis 3) jog. One axis at a time."""
+        if axis not in (2, 3) or direction not in (-1, 1):
+            logger.error(f"[OperatorClient] Refusing joint jog axis={axis} direction={direction}")
+            return False
+        return self.execute_hardware_operation(0x01, struct.pack(">Bb", axis, direction))
+
+    def joint_jog_stop(self) -> bool:
+        """Stop the current supervised ER-V joint jog."""
+        return self.execute_hardware_operation(0x02, b"")
+
     def erv_enable_control(self) -> bool:
         """Request ACL 'CON' to clear faults and re-enable ER-V servo control."""
         logger.info("[OperatorClient] Sending ER-V Enable Control (CON)...")
