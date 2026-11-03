@@ -4,6 +4,9 @@ import time
 import uuid
 
 
+PERCEPTION_VERSION = "head-aim-v1"
+
+
 class PerceptionStore:
     def __init__(self):
         self.enabled = True
@@ -44,7 +47,8 @@ class PerceptionStore:
     def snapshot(self):
         with self._lock:
             sample = self._sample
-            payload = {"schema_version": 1, "session_id": self.session_id,
+            payload = {"schema_version": 1, "version": PERCEPTION_VERSION,
+                       "session_id": self.session_id,
                        "enabled": self.enabled, "sample": None}
             if sample is not None:
                 payload["sample"] = {k: v for k, v in sample.items() if k not in ("captured", "pose_captured")}

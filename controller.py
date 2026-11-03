@@ -270,7 +270,8 @@ class TrackingController:
 
             box = self.calculate_acceptable_box(frame_w, frame_h)
             left, top, right, bottom = box
-            frame_cx, frame_cy = frame_w // 2, frame_h // 4
+            target_cx = (left + right) // 2
+            target_cy = (top + bottom) // 2
             status = self._status(box, now, observed_at)
 
             if not self.enabled:
@@ -345,7 +346,7 @@ class TrackingController:
             self.tracked_target_center = target.center
             self.last_target_time = now
             tx, ty = target.center
-            err_x, err_y = tx - frame_cx, ty - frame_cy
+            err_x, err_y = tx - target_cx, ty - target_cy
             status.target_center = (tx, ty)
             status.target_box = target.box
             status.target_confidence = target.confidence
@@ -376,8 +377,8 @@ class TrackingController:
                     status.current_command = "HOLDING (ON TARGET)"
                     self._mark_status_stopped(status)
                     return status
-            inside_x = left <= aim_x <= right or (self.continuous_tracking and err_x * (aim_x - frame_cx) <= 0)
-            inside_y = top <= aim_y <= bottom or (self.continuous_tracking and err_y * (aim_y - frame_cy) <= 0)
+            inside_x = left <= aim_x <= right or (self.continuous_tracking and err_x * (aim_x - target_cx) <= 0)
+            inside_y = top <= aim_y <= bottom or (self.continuous_tracking and err_y * (aim_y - target_cy) <= 0)
             if inside_x and inside_y:
                 self._stop_movement_locked("target entered deadband", now)
                 self.state = TrackingState.CENTERED
@@ -388,8 +389,8 @@ class TrackingController:
                 self._mark_status_stopped(status)
                 return status
 
-            desired_azimuth = 0 if inside_x else (1 if aim_x > frame_cx else -1)
-            desired_altitude = 0 if inside_y else (-1 if aim_y > frame_cy else 1)
+            desired_azimuth = 0 if inside_x else (1 if aim_x > target_cx else -1)
+            desired_altitude = 0 if inside_y else (-1 if aim_y > target_cy else 1)
 
             if self.is_currently_moving and not self.continuous_tracking:
                 reversed_direction = (
@@ -421,13 +422,13 @@ class TrackingController:
 
             half_deadband_x = max(1, (right - left) // 2)
             half_deadband_y = max(1, (bottom - top) // 2)
-            excess_x = max(0, abs(aim_x - frame_cx) - half_deadband_x)
-            excess_y = max(0, abs(aim_y - frame_cy) - half_deadband_y)
-            norm_x = excess_x / max(1, frame_cx - half_deadband_x)
+            excess_x = max(0, abs(aim_x - target_cx) - half_deadband_x)
+            excess_y = max(0, abs(aim_y - target_cy) - half_deadband_y)
+            norm_x = excess_x / max(1, target_cx - half_deadband_x)
             vertical_range = (
-                frame_h - frame_cy - half_deadband_y
+                frame_h - target_cy - half_deadband_y
                 if err_y > 0
-                else frame_cy - half_deadband_y
+                else target_cy - half_deadband_y
             )
             norm_y = excess_y / max(1, vertical_range)
 
