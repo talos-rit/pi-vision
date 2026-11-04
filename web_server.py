@@ -85,15 +85,16 @@ def create_app(
         """Annotates frame with bounding box, acceptable deadband, reticles, and diagnostics."""
         canvas = frame.copy()
         h, w = canvas.shape[:2]
-        cx, cy = w // 2, h // 2
-
-        # Draw acceptable center deadband box
+        # Draw the acceptable region around the eye-line target (around 1/3 height)
         left, top, right, bottom = status.acceptable_box
+        cx, cy = (left + right) // 2, (top + bottom) // 2
         deadband_color = (255, 200, 0) if status.state == TrackingState.CENTERED else (100, 100, 100)
         cv2.rectangle(canvas, (left, top), (right, bottom), deadband_color, 2)
         cv2.putText(canvas, "ACCEPTABLE REGION", (left + 5, top + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, deadband_color, 1)
 
-        # Draw camera center crosshair
+        # Draw the eye-line reference
+        cv2.line(canvas, (0, cy), (w - 1, cy), (80, 80, 80), 1)
+        cv2.putText(canvas, "EYE LINE (1/3)", (5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
         cv2.drawMarker(canvas, (cx, cy), (80, 80, 80), cv2.MARKER_CROSS, 20, 1)
 
         # Draw detected target if present

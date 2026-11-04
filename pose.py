@@ -62,13 +62,13 @@ class PoseDetector:
             if score < self.conf_thresh:
                 continue
             keypoints = row[5:].reshape(17, 3)
-            aim = self._torso_aim(keypoints)
-            if aim is None:
-                continue
             cx, cy, bw, bh = (float(value) for value in row[:4])
             x1, y1 = max(0.0, cx - bw / 2), max(0.0, cy - bh / 2)
             x2, y2 = min(float(infer_w), cx + bw / 2), min(float(infer_h), cy + bh / 2)
             if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            aim = self._head_aim(keypoints, (x1, y1, x2, y2))
+            if aim is None:
                 continue
             boxes.append([x1, y1, x2 - x1, y2 - y1]); scores.append(score)
             candidates.append((x1, y1, x2, y2, aim, score, keypoints))
@@ -85,6 +85,7 @@ class PoseDetector:
             for index, (x1, y1, x2, y2, aim, score, keypoints) in ((index, candidates[index]) for index in indices)
         ]
 
+    # I don't believe this is used anywhere after switching to head aim
     def _torso_aim(self, points: np.ndarray):
         # COCO: shoulders 5/6, hips 11/12. Require a pair; isolated points do
         # not make a static object a person.
@@ -94,3 +95,41 @@ class PoseDetector:
             return None
         a, b = valid[0]
         return ((float(a[0]) + float(b[0])) / 2, (float(a[1]) + float(b[1])) / 2)
+
+    def _head_aim(
+        self, points: np.ndarray, box: tuple[float, float, float, float]
+    ) -> tuple[float, float] | None:
+        # COCO: shoulders 5/6, hips 11/12. Require a pair; isolated points do
+        # not make a static object a person.
+        pairs = ((5, 6), (11, 12))
+        valid = [
+            (points[a], points[b])
+            for a, b in pairs
+            if points[a, 2] >= self.keypoint_thresh
+            or points[b, 2] >= self.keypoint_thresh # debugging put this back at and later
+        ]
+        if not valid:
+            return None
+
+        # COCO facial points: nose 0, eyes 1/2, ears 3/4 -- prefer eye level first
+        if points[1, 2] >= self.keypoint_thresh and points[2, 2] >= self.keypoint_thresh:
+            return (
+                (float(points[1, 0]) + float(points[2, 0])) / 2,
+                (float(points[1, 1]) + float(points[2, 1])) / 2,
+            )
+        if points[0, 2] >= self.keypoint_thresh:
+            return float(points[0, 0]), float(points[0, 1])
+
+        face_points = [
+            points[index]
+            for index in (1, 2, 3, 4)
+            if points[index, 2] >= self.keypoint_thresh
+        ]
+        if face_points:
+            return (
+                sum(float(point[0]) for point in face_points) / len(face_points),
+                sum(float(point[1]) for point in face_points) / len(face_points),
+            )
+
+        x1, y1, x2, y2 = box
+        return (x1 + x2) / 2, y1 + 0.08 * (y2 - y1)
