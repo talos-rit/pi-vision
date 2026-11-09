@@ -113,12 +113,14 @@ def create_app(
             cv2.rectangle(canvas, (x1, y1), (x2, y2), box_color, 2)
             if status.target_keypoints:
                 points = status.target_keypoints
+                # Keypoints are floats (sub-pixel); OpenCV drawing needs integer pixel coordinates.
+                pt = lambda p: (int(round(p[0])), int(round(p[1])))
                 for a, b in ((5,6),(5,7),(7,9),(6,8),(8,10),(5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)):
                     if points[a][2] >= .30 and points[b][2] >= .30:
-                        cv2.line(canvas, points[a][:2], points[b][:2], (255, 255, 0), 2)
+                        cv2.line(canvas, pt(points[a]), pt(points[b]), (255, 255, 0), 2)
                 for x, y, confidence in points:
                     if confidence >= .30:
-                        cv2.circle(canvas, (x, y), 3, (255, 255, 0), -1)
+                        cv2.circle(canvas, pt((x, y)), 3, (255, 255, 0), -1)
             cv2.circle(canvas, (tcx, tcy), 6, box_color, -1)
 
             # Error vector line pointing from camera center to target

@@ -98,6 +98,20 @@ PITCH_MAX_COUNT=
 
 Keep every pulse below Operator's independent 500 ms continuous-motion watchdog.
 
+Inference load (one arm per Raspberry Pi 4):
+
+```text
+INFERENCE_FPS=4        # cap on detections per second (0 = unlimited); video is unaffected
+POSE_THREADS=2         # onnxruntime intra-op threads
+POSE_SPINNING=0
+```
+
+`--processing-width 640` downscales frames before inference and overlays (0 = full size).
+
+Operator reports its controller profile (`PROFILE native` or `PROFILE esp-one-axis`).
+`GET /api/v1/control/status` relays it as `controller_profile`, and Commander refuses to
+move an arm whose profile doesn't match its settings.
+
 ## Local verification
 
 From the senior-project directory:
