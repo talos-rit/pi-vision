@@ -15,6 +15,13 @@ try:
 except ImportError:
     from operator_faults import OperatorFaultLog
 
+# Same four-byte token Operator writes when it queues an ICD frame. Kept here
+# so a deployed Pi tracker can see it without Commander's package installed.
+_ACK_TOKEN = b"ACK\x00"
+_ACK_LINE = b"ACK\n"
+_COMMAND_LABELS = {0: "Handshake", 1: "Aim", 2: "Home", 3: "Jog", 4: "Stop", 5: "Move", 6: "Extend", 7: "Stop", 8: "Hardware", 9: "Read speed", 10: "Speed"}
+_HARDWARE_LABELS = {1: "Joint jog", 2: "Stop joint", 3: "Joint move", 4: "Enable control", 5: "Speed", 6: "Tracking jog"}
+
 
 # ICD Command IDs from commander/src/icd_config.py
 class ICDCommand:
@@ -60,6 +67,8 @@ class OperatorClient:
         self.socket: Optional[socket.socket] = None
         self.is_running = False
         self.is_connected = False
+        self.controller_profile = None
+        self._profile_received = 0.0
         self.command_counter = 0
         self._send_lock = threading.RLock()
         self._telemetry_lock = threading.Lock()
@@ -69,6 +78,13 @@ class OperatorClient:
         self._fault_lock = threading.Lock()
         self._fault_message: Optional[str] = None
         self._fault_log = OperatorFaultLog()
+        self._receipt_lock = threading.Lock()
+        self._sent = 0
+        self._acked = 0
+        self._last_command: Optional[str] = None
+        self._last_sent: Optional[float] = None
+        self._last_ack: Optional[float] = None
+        self._last_failed = False
         self._fault_thread = None
 
         if auto_connect:
@@ -100,6 +116,7 @@ class OperatorClient:
 
     def _disconnect(self):
         self.is_connected = False
+        self.controller_profile = None
         with self._send_lock:
             if self.socket:
                 try:
@@ -140,6 +157,27 @@ class OperatorClient:
                         self._disconnect()
                         break
                     buffer += chunk
+                    acks = 0
+                    while True:
+                        nul_at = buffer.find(_ACK_TOKEN)
+                        line_at = buffer.find(_ACK_LINE)
+                        if nul_at == -1 and line_at == -1:
+                            break
+                        if line_at != -1 and (nul_at == -1 or line_at < nul_at):
+                            end = line_at + len(_ACK_LINE)
+                            if end < len(buffer) and buffer[end:end + 1] == b"\x00":
+                                end += 1
+                            buffer = buffer[:line_at] + buffer[end:]
+                            acks += 1
+                            continue
+                        buffer = buffer[:nul_at] + buffer[nul_at + len(_ACK_TOKEN):]
+                        acks += 1
+                    if acks:
+                        with self._receipt_lock:
+                            self._acked += acks
+                            self._last_ack = time.monotonic()
+                    if buffer.startswith(b"\x00"):
+                        buffer = buffer[1:]
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         decoded = line.decode(errors="replace").strip()
@@ -162,7 +200,10 @@ class OperatorClient:
         if not parts:
             return
 
-        if parts[0] in ("TELP", "TEL") and len(parts) >= 6:
+        if len(parts) == 2 and parts[0] == "PROFILE" and parts[1] in ("native", "esp-one-axis"):
+            self.controller_profile = parts[1]
+            self._profile_received = time.monotonic()
+        elif parts[0] in ("TELP", "TEL") and len(parts) >= 6:
             try:
                 base, shoulder, elbow, wrist_pitch, wrist_roll = (int(p) for p in parts[1:6])
                 with self._telemetry_lock:
@@ -187,6 +228,11 @@ class OperatorClient:
                 listener(line)
             except Exception as e:
                 logger.error(f"[OperatorClient] Listener error: {e}")
+
+    def get_controller_profile(self):
+        if not self.is_connected or time.monotonic() - self._profile_received > 3:
+            return None
+        return self.controller_profile
 
     def get_telemetry(self) -> RobotTelemetry:
         """Thread-safe snapshot of latest telemetry."""
@@ -223,10 +269,37 @@ class OperatorClient:
             crc ^= b
         return crc
 
+    def command_receipt(self) -> Optional[dict]:
+        with self._receipt_lock:
+            if self._sent == 0 and not self._last_failed:
+                return None
+            now = time.monotonic()
+            return {
+                "sent": self._sent,
+                "acked": self._acked,
+                "last_command": self._last_command,
+                "last_sent_age_s": None if self._last_sent is None else round(now - self._last_sent, 3),
+                "last_ack_age_s": None if self._last_ack is None else round(now - self._last_ack, 3),
+                "last_failed": self._last_failed,
+            }
+
+    def _note_sent(self, label: str, *, ok: bool) -> None:
+        with self._receipt_lock:
+            self._last_command = label
+            self._last_sent = time.monotonic()
+            self._last_failed = not ok
+            if ok:
+                self._sent += 1
+
     def send_command(self, command_id: int, payload: bytes = b"") -> bool:
         """Builds and sends an ICD packet to Operator."""
+        if command_id == 8 and payload:
+            label = _HARDWARE_LABELS.get(payload[0], "Hardware")
+        else:
+            label = _COMMAND_LABELS.get(command_id, f"Command {command_id}")
         if not self.is_connected or not self.socket:
             logger.warning(f"[OperatorClient] Cannot send command {hex(command_id)}: Not connected to Operator.")
+            self._note_sent(label, ok=False)
             return False
 
         with self._send_lock:
@@ -242,11 +315,13 @@ class OperatorClient:
 
             try:
                 self.socket.sendall(packet)
-                return True
             except OSError as e:
                 logger.error(f"[OperatorClient] Send failed: {e}")
                 self._disconnect()
+                self._note_sent(label, ok=False)
                 return False
+            self._note_sent(label, ok=True)
+            return True
 
     # Convenience motion commands
     def polar_pan_continuous_start(self, moving_azimuth: int = 0, moving_altitude: int = 0) -> bool:
