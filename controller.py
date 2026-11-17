@@ -247,6 +247,16 @@ class TrackingController:
         with self._lock:
             self.acceptable_ratio = float(ratio)
 
+    def set_speed_percent(self, percent: int) -> None:
+        """Change the tracking speed. Applied to Operator at once while tracking."""
+        if type(percent) is not int or not 1 <= percent <= 100:
+            raise ValueError("speed must be 1..100")
+        with self._lock:
+            if self.enabled and percent != self.speed_percent:
+                if not self.operator.erv_set_speed_percent(percent):
+                    raise RuntimeError("Operator rejected the tracking speed request.")
+            self.speed_percent = percent
+
     def set_vertical_axes(
         self,
         elbow=None,

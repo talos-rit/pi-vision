@@ -272,7 +272,7 @@ def create_app(
     def control_tuning(payload: dict):
         if control_lease is None:
             raise HTTPException(409, "start PiVision with --edge-control")
-        return control_lease.tune(payload.get("owner"), payload.get("acceptable_ratio"))
+        return control_lease.tune(payload.get("owner"), payload.get("acceptable_ratio"), payload.get("speed_percent"))
 
     @app.post("/api/v1/control/commands")
     def manual_edge_command(payload: dict):
