@@ -272,14 +272,21 @@ class TrackingController:
             self.acceptable_ratio = float(ratio)
 
     def set_speed_percent(self, percent: int) -> None:
-        """Change the tracking speed. Applied to Operator at once while tracking."""
+        """Change the tracking speed. Applied to Operator at once while tracking.
+
+        What gets sent is the speed for the axis now moving (base when idle), so a
+        change mid-move never lifts that joint's speed cap.
+        """
         if type(percent) is not int or not 1 <= percent <= 100:
             raise ValueError("speed must be 1..100")
         with self._lock:
-            if self.enabled and percent != self.speed_percent:
-                if not self.operator.erv_set_speed_percent(percent):
-                    raise RuntimeError("Operator rejected the tracking speed request.")
-            self.speed_percent = percent
+            previous, self.speed_percent = self.speed_percent, percent
+            if not self.enabled:
+                return
+            moving = self._moving_axis() if self.is_currently_moving else None
+            if not self._apply_axis_speed(moving[0] if moving else "base"):
+                self.speed_percent = previous
+                raise RuntimeError("Operator rejected the tracking speed request.")
 
     def set_vertical_axes(
         self,

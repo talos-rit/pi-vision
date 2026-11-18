@@ -217,6 +217,17 @@ def test_joint_moves_run_at_the_capped_speed_and_base_moves_restore_it():
     assert (elbow_move.speed_percent, base_move.speed_percent) == (30, 50)
 
 
+def test_live_speed_change_keeps_the_moving_joints_cap():
+    tracker, operator = controller(reading(0.0, base=0, elbow=0), axis_max_speed_percent={"elbow": 30})
+    tracker.enabled, tracker._applied_speed = True, 50
+    assert tracker._start_joint(3, -1, 0.1, now=0.1)
+    tracker.set_speed_percent(80)  # The elbow stays at its cap.
+    assert tracker._start_pulse(1, 0, 0.1, now=0.2)
+    assert operator.speeds == [30, 80]
+    tracker.set_speed_percent(60)  # Base is uncapped: applied at once.
+    assert operator.speeds == [30, 80, 60]
+
+
 def test_settle_allowance_widens_every_bound():
     model = TravelModel(MODEL.rate_at_100, MODEL.count_sign, settle_counts=25)
     assert TravelEstimator(model).count_range("base", reading(0.0, base=100), now=0.1, speed_percent=50) == (75, 125)
