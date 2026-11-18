@@ -19,6 +19,7 @@ from loguru import logger
 try:
     from .config import CONFIG
     from .controller import ControllerStatus, TrackingController
+    from .travel_budget import DEFAULT_TRAVEL_MODEL, TravelModel
     from .detector import Detection
     from .pose import PoseDetector
     from .operator_client import OperatorClient
@@ -31,6 +32,7 @@ try:
 except ImportError:
     from config import CONFIG
     from controller import ControllerStatus, TrackingController
+    from travel_budget import DEFAULT_TRAVEL_MODEL, TravelModel
     from detector import Detection
     from pose import PoseDetector
     from operator_client import OperatorClient
@@ -228,8 +230,16 @@ def main():
         max_base_pulse=CONFIG.max_base_pulse_s,
         max_pitch_pulse=CONFIG.max_pitch_pulse_s,
         speed_percent=CONFIG.default_speed_percent,
+        axis_max_speed_percent=CONFIG.axis_max_speed_percent,
         continuous_tracking=True,
+        travel_model=TravelModel(
+            rate_at_100={**DEFAULT_TRAVEL_MODEL.rate_at_100, **CONFIG.travel_rate},
+            count_sign={**DEFAULT_TRAVEL_MODEL.count_sign, **CONFIG.travel_sign},
+            coast_s=CONFIG.travel_coast_s or DEFAULT_TRAVEL_MODEL.coast_s,
+        ),
     )
+    model = controller.travel.model
+    logger.info(f"[Limits] Travel model: rate@100={model.rate_at_100} sign={model.count_sign} coast={model.coast_s}s")
 
     if args.auto_start:
         controller.set_enabled(True)

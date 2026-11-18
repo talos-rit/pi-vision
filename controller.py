@@ -11,18 +11,24 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Deque, List, Optional, Tuple
+from typing import Dict, Deque, List, Optional, Tuple
 
 from loguru import logger
 
 try:
     from .detector import Detection
     from .operator_client import OperatorClient
+    from .travel_budget import DEFAULT_TRAVEL_MODEL, TravelEstimator, TravelModel, reaches_limit
     from .vertical_axes import select_vertical_motion
 except ImportError:
     from detector import Detection
     from operator_client import OperatorClient
+    from travel_budget import DEFAULT_TRAVEL_MODEL, TravelEstimator, TravelModel, fresh_count_range, reaches_limit
     from vertical_axes import select_vertical_motion
+
+
+# Longest motion allowed while the newest joint reading predates it.
+UNANCHORED_MOTION_S = 1.0
 
 
 class TrackingState(str, Enum):
@@ -78,6 +84,8 @@ class TrackingController:
         max_pitch_pulse: float = 0.09,
         speed_percent: int = 20,
         continuous_tracking: bool = False,
+        travel_model: Optional[TravelModel] = None,
+        axis_max_speed_percent: Optional[Dict[str, int]] = None,
     ):
         if not 0.0 < acceptable_ratio < 1.0:
             raise ValueError("acceptable_ratio must be between zero and one")
@@ -100,6 +108,13 @@ class TrackingController:
         self.max_pitch_pulse = max_pitch_pulse
         self.speed_percent = max(1, min(100, speed_percent))
         self.continuous_tracking = continuous_tracking
+        self.travel = TravelEstimator(travel_model or DEFAULT_TRAVEL_MODEL, telemetry_timeout)
+        self._reading_requested_for: Optional[float] = None
+        # Per-axis SPEED caps, e.g. {"elbow": 30, "pitch": 20}. Lifting the elbow
+        # from rest at SPEED >= 50 trips IMPACT PROTECTION, and pitch turns 2-6x
+        # faster than base in degrees at the same SPEED, so it overshoots.
+        self.axis_max_speed_percent = dict(axis_max_speed_percent or {})
+        self._applied_speed: Optional[int] = None
         self.track_elbow = False
         self.track_shoulder = False
         self.track_polar_vertical = True
@@ -166,6 +181,7 @@ class TrackingController:
                 self.state = TrackingState.FAULT
                 self.last_thought = "Operator rejected the tracking speed request."
                 return False
+            self._applied_speed = self.speed_percent
 
             self.enabled = True
             self.state = TrackingState.SEARCHING
@@ -197,6 +213,7 @@ class TrackingController:
             self.operator.joint_jog_stop()
         else:
             self.operator.polar_pan_continuous_stop()
+        self.travel.stop(stopped_at)
         self.is_currently_moving = False
         self._motion_kind = None
         self.current_joint_axis = 0
@@ -216,6 +233,13 @@ class TrackingController:
         current = time.monotonic() if now is None else now
         with self._lock:
             if not self.is_currently_moving:
+                return
+            moving = self._moving_axis()
+            reason = moving and self._limit_block(*moving, current)
+            if reason:
+                self._stop_movement_locked(reason, current)
+                self.state = TrackingState.LIMIT_REACHED
+                self.last_thought = f"Motion blocked by joint safety policy: {reason}."
                 return
             if self.continuous_tracking:
                 if self.operator.get_fault() or not self.operator.is_connected:
@@ -248,14 +272,21 @@ class TrackingController:
             self.acceptable_ratio = float(ratio)
 
     def set_speed_percent(self, percent: int) -> None:
-        """Change the tracking speed. Applied to Operator at once while tracking."""
+        """Change the tracking speed. Applied to Operator at once while tracking.
+
+        What gets sent is the speed for the axis now moving (base when idle), so a
+        change mid-move never lifts that joint's speed cap.
+        """
         if type(percent) is not int or not 1 <= percent <= 100:
             raise ValueError("speed must be 1..100")
         with self._lock:
-            if self.enabled and percent != self.speed_percent:
-                if not self.operator.erv_set_speed_percent(percent):
-                    raise RuntimeError("Operator rejected the tracking speed request.")
-            self.speed_percent = percent
+            previous, self.speed_percent = self.speed_percent, percent
+            if not self.enabled:
+                return
+            moving = self._moving_axis() if self.is_currently_moving else None
+            if not self._apply_axis_speed(moving[0] if moving else "base"):
+                self.speed_percent = previous
+                raise RuntimeError("Operator rejected the tracking speed request.")
 
     def set_vertical_axes(
         self,
@@ -380,9 +411,6 @@ class TrackingController:
                 self._mark_status_stopped(status)
                 return status
 
-            telemetry = self.operator.get_telemetry()
-            measured_limits_available = telemetry.is_fresh(self.telemetry_timeout, now)
-
             if not detections:
                 self._target_sample = None
                 self._target_velocity = (0.0, 0.0)
@@ -495,11 +523,11 @@ class TrackingController:
                 not vertical_needed or norm_x >= norm_y
             )
             if use_base:
-                if self.enable_joint_limits and measured_limits_available and (
-                    (desired_azimuth > 0 and telemetry.base >= self.base_max)
-                    or (desired_azimuth < 0 and telemetry.base <= self.base_min)
-                ):
-                    return self._limit_status(status, f"base count {telemetry.base}")
+                reason = self._limit_block("base", desired_azimuth, now)
+                if reason:
+                    self._stop_movement_locked(reason, now)
+                    self._mark_status_stopped(status)
+                    return self._limit_status(status, reason)
                 pulse = self.min_pulse + (self.max_base_pulse - self.min_pulse) * min(1.0, norm_x)
                 self.current_jog_interval_ms = self.jog_interval("base", norm_x)
                 if not self._start_pulse(desired_azimuth, 0, pulse, now):
@@ -510,13 +538,7 @@ class TrackingController:
                     shoulder=self.track_shoulder,
                     polar_vertical=self.track_polar_vertical,
                     image_up=desired_altitude > 0,
-                    elbow_count=telemetry.elbow,
-                    shoulder_count=telemetry.shoulder,
-                    pitch_count=telemetry.wrist_pitch,
-                    counts_fresh=measured_limits_available,
-                    elbow_limits=self.elbow_limits,
-                    shoulder_limits=self.shoulder_limits,
-                    pitch_limits=self.pitch_limits if self.enable_joint_limits else None,
+                    blocked=lambda axis, direction: bool(self._limit_block(axis, direction, now)),
                 )
                 if motion is None:
                     self._stop_movement_locked("vertical axes are at a stop", now)
@@ -575,13 +597,17 @@ class TrackingController:
     def _start_joint(self, axis: int, direction: int, duration: float, now: float) -> bool:
         if self.is_currently_moving and self._motion_kind != "joint":
             self.operator.polar_pan_continuous_stop()
+            self.travel.stop(now)
             self.is_currently_moving = False
             self._motion_kind = None
         elif self._motion_kind == "joint" and (self.current_joint_axis, self.current_joint_direction) != (axis, direction):
             self.operator.joint_jog_stop()
+            self.travel.stop(now)
             self.is_currently_moving = False
-        if not self.operator.joint_jog_start(axis, direction):
+        name = "elbow" if axis == 3 else "shoulder"
+        if not self._apply_axis_speed(name) or not self.operator.joint_jog_start(axis, direction):
             return False
+        self.travel.start(name, direction, now, self._axis_speed(name))
         self.is_currently_moving = True
         self._motion_kind = "joint"
         self.current_joint_axis = axis
@@ -600,12 +626,15 @@ class TrackingController:
     def _start_pulse(self, azimuth: int, altitude: int, duration: float, now: float) -> bool:
         if self._motion_kind == "joint":
             self.operator.joint_jog_stop()
+            self.travel.stop(now)
             self.is_currently_moving = False
             self._motion_kind = None
             self.current_joint_axis = 0
             self.current_joint_direction = 0
-        if not self._send_tracking_direction(azimuth, altitude):
+        axis_name = "base" if azimuth else "pitch"
+        if not self._apply_axis_speed(axis_name) or not self._send_tracking_direction(azimuth, altitude):
             return False
+        self.travel.start(axis_name, azimuth or altitude, now, self._axis_speed(axis_name))
         self.is_currently_moving = True
         self._motion_kind = "polar"
         self.current_azimuth = azimuth
@@ -617,6 +646,81 @@ class TrackingController:
         self._log(f"Following {axis}, direction={direction}." if self.continuous_tracking
                   else f"Started {duration * 1000:.0f}ms {axis} pulse, direction={direction}.")
         return True
+
+    def _axis_speed(self, axis: str) -> int:
+        cap = self.axis_max_speed_percent.get(axis)
+        return min(self.speed_percent, cap) if cap else self.speed_percent
+
+    def _apply_axis_speed(self, axis: str) -> bool:
+        """Send SPEED when the next move's axis needs a different one.
+
+        Operator queues SPEED and holds the following jog until it completes, so
+        the change costs one prompt round trip, and only on axis switches.
+        """
+        target = self._axis_speed(axis)
+        if target == self._applied_speed:
+            return True
+        if not self.operator.erv_set_speed_percent(target):
+            return False
+        self._applied_speed = target
+        return True
+
+    def _axis_limits(self, axis: str) -> Optional[Tuple[int, int]]:
+        if not self.enable_joint_limits:
+            return None
+        return {
+            "base": (self.base_min, self.base_max),
+            "shoulder": self.shoulder_limits,
+            "elbow": self.elbow_limits,
+            "pitch": self.pitch_limits,
+        }[axis]
+
+    def _moving_axis(self) -> Optional[Tuple[str, int]]:
+        if self._motion_kind == "joint":
+            return ("elbow" if self.current_joint_axis == 3 else "shoulder", self.current_joint_direction)
+        if self.current_azimuth:
+            return ("base", self.current_azimuth)
+        if self.current_altitude:
+            return ("pitch", self.current_altitude)
+        return None
+
+    def _limit_block(self, axis: str, direction: int, now: float) -> Optional[str]:
+        """Why moving `axis` in `direction` must stop before the next check, if it must.
+
+        Uses the newest reading plus a worst-case bound on every move since, so a
+        continuous follow is checked although Operator cannot poll mid-move. An arm
+        without telemetry is not limited. If the newest reading was already stale
+        when motion began, the arm may move for UNANCHORED_MOTION_S; the stop that
+        follows lets Operator take a fresh reading.
+
+        When only that uncertainty blocks the move (a fresh reading would not),
+        Operator is asked to poll right away instead of after its quiet window.
+        """
+        limits = self._axis_limits(axis)
+        if limits is None or not direction:
+            return None
+        telemetry = self.operator.get_telemetry()
+        since = self.travel.unanchored_since(telemetry, now)
+        if since is not None:
+            if now + self.travel.model.lookahead_s - since >= UNANCHORED_MOTION_S:
+                self._request_reading(telemetry)
+                return "waiting for a fresh joint reading"
+            return None
+        model, speed = self.travel.model, self._axis_speed(axis)
+        count_range = self.travel.count_range(axis, telemetry, now, speed, planned=direction)
+        if count_range is None or not reaches_limit(model, axis, direction, count_range, limits):
+            return None
+        count = float(getattr(telemetry, "wrist_pitch" if axis == "pitch" else axis))
+        if reaches_limit(model, axis, direction, fresh_count_range(model, axis, count, speed), limits):
+            return f"{axis} would reach its limit"
+        self._request_reading(telemetry)
+        return f"{axis} may be near its limit; waiting for a fresh joint reading"
+
+    def _request_reading(self, telemetry) -> None:
+        # Once per reading: the request stays pending in Operator until it polls.
+        if self._reading_requested_for != telemetry.last_updated_monotonic:
+            self._reading_requested_for = telemetry.last_updated_monotonic
+            self.operator.request_telemetry()
 
     def _limit_status(self, status: ControllerStatus, reason: str) -> ControllerStatus:
         self.state = TrackingState.LIMIT_REACHED

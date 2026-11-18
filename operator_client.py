@@ -20,7 +20,7 @@ except ImportError:
 _ACK_TOKEN = b"ACK\x00"
 _ACK_LINE = b"ACK\n"
 _COMMAND_LABELS = {0: "Handshake", 1: "Aim", 2: "Home", 3: "Jog", 4: "Stop", 5: "Move", 6: "Extend", 7: "Stop", 8: "Hardware", 9: "Read speed", 10: "Speed"}
-_HARDWARE_LABELS = {1: "Joint jog", 2: "Stop joint", 3: "Joint move", 4: "Enable control", 5: "Speed", 6: "Tracking jog"}
+_HARDWARE_LABELS = {1: "Joint jog", 2: "Stop joint", 3: "Joint move", 4: "Enable control", 5: "Speed", 6: "Tracking jog", 7: "Request telemetry"}
 
 
 # ICD Command IDs from commander/src/icd_config.py
@@ -375,6 +375,10 @@ class OperatorClient:
         val = max(1, min(100, percent))
         logger.info(f"[OperatorClient] Setting ER-V Speed to {val}%...")
         return self.execute_hardware_operation(0x05, struct.pack("B", val))
+
+    def request_telemetry(self) -> bool:
+        """Ask Operator to poll joint positions as soon as the arm is idle."""
+        return self.execute_hardware_operation(0x07, b"")
 
     def home(self, delay_ms: int = 0) -> bool:
         payload = struct.pack(">I", delay_ms)

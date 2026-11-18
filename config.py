@@ -1,7 +1,7 @@
 # Pi Edge Tracker & Closed-Loop Controller Configuration
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _optional_int(name: str) -> int | None:
@@ -32,6 +32,12 @@ class TrackerConfig:
     
     # Closed-loop tracking parameters (Conservative to prevent overshoot)
     default_speed_percent: int = int(os.getenv("DEFAULT_SPEED", "20"))       # 20% gentle tracking speed
+    # Per-axis tracking SPEED caps (0 disables one). Lifting the elbow from rest
+    # at 50%+ trips IMPACT PROTECTION on Bingo; pitch overshoots above ~20%.
+    axis_max_speed_percent: dict = field(default_factory=lambda: {
+        axis: int(os.getenv(f"{axis.upper()}_MAX_SPEED", default))
+        for axis, default in (("base", "0"), ("shoulder", "30"), ("elbow", "30"), ("pitch", "20"))
+    })
     acceptable_box_ratio: float = float(os.getenv("DEADBAND_RATIO", "0.25"))
     control_rate_hz: float = float(os.getenv("CONTROL_RATE_HZ", "60.0"))
     target_lost_timeout_s: float = float(os.getenv("TARGET_LOST_TIMEOUT", "0.35"))
@@ -43,13 +49,29 @@ class TrackerConfig:
     max_base_pulse_s: float = float(os.getenv("MAX_BASE_PULSE", "0.16"))
     max_pitch_pulse_s: float = float(os.getenv("MAX_PITCH_PULSE", "0.09"))
     
-    # Autocorrection & Joint safety limits (from Bluey calibration)
+    # Joint safety limits. Base: Bingo's controller stops at about -5100
+    # (LOWER LIMIT AXIS 1) and the camera cable is taut past about +4800, so
+    # keep inside both. Only arms that report telemetry are limited.
     enable_joint_limits: bool = True
-    base_min_count: int = -5000
-    base_max_count: int = 5000
+    base_min_count: int = int(os.getenv("BASE_MIN_COUNT", "-4500"))
+    base_max_count: int = int(os.getenv("BASE_MAX_COUNT", "4500"))
     # Optional extra count limits; pitch uses Operator's existing wrist-pitch path.
     pitch_min_count: int | None = _optional_int("PITCH_MIN_COUNT")
     pitch_max_count: int | None = _optional_int("PITCH_MAX_COUNT")
+    # Travel-budget overrides (see travel_budget.py), e.g. TRAVEL_RATE_BASE=1800
+    # (upper-bound counts/s at SPEED 100) and TRAVEL_SIGN_SHOULDER=-1.
+    travel_rate: dict = None
+    travel_sign: dict = None
+    travel_coast_s: float | None = None
+
+    def __post_init__(self):
+        axes = ("base", "shoulder", "elbow", "pitch")
+        self.travel_rate = {a: float(os.environ[f"TRAVEL_RATE_{a.upper()}"]) for a in axes
+                            if os.getenv(f"TRAVEL_RATE_{a.upper()}")}
+        self.travel_sign = {a: int(os.environ[f"TRAVEL_SIGN_{a.upper()}"]) for a in axes
+                            if os.getenv(f"TRAVEL_SIGN_{a.upper()}")}
+        coast = os.getenv("TRAVEL_COAST_S")
+        self.travel_coast_s = float(coast) if coast else None
     
     # Web UI server configuration
     web_host: str = os.getenv("WEB_HOST", "0.0.0.0")
