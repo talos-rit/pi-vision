@@ -27,6 +27,7 @@ class FakeOperator:
         self.stops = 0
         self.accept_starts = True
         self.speeds = []
+        self.reading_requests = 0
 
     def get_telemetry(self):
         return self.telemetry
@@ -42,6 +43,10 @@ class FakeOperator:
 
     def erv_set_speed_percent(self, percent):
         self.speeds.append(percent)
+        return True
+
+    def request_telemetry(self):
+        self.reading_requests += 1
         return True
 
     def polar_pan_continuous_stop(self):
@@ -101,13 +106,24 @@ def test_continuous_follow_stops_before_the_limit_without_new_telemetry():
     assert stopped_at - 0.1 == pytest.approx((1000 - 900 * 0.45) / 900, abs=0.03)
     # Even at the worst-case rate, the arm stops short of -5000.
     assert -4000 - 900 * (stopped_at - 0.1 + MODEL.coast_s) > -5000
+    # The reading itself is 1000 counts clear, so only uncertainty stopped it:
+    # Operator is asked for a reading once instead of after its quiet window.
+    assert "waiting for a fresh joint reading" in tracker.last_thought
+    assert operator.reading_requests == 1
+    tracker._limit_block("base", 1, now=t + 0.1)
+    assert operator.reading_requests == 1
+    # A reading taken after the coast lets the follow resume.
+    operator.telemetry = reading(t + 1.0, base=-4300)
+    assert not tracker._limit_block("base", 1, now=t + 1.1)
 
 
 def test_base_limit_uses_bingos_count_sign():
     # Near +5000, +azimuth lowers the count (safe) and -azimuth raises it (blocked).
-    tracker, _ = controller(reading(0.0, base=4900))
+    tracker, operator = controller(reading(0.0, base=4900))
     assert not tracker._limit_block("base", 1, now=0.1)
     assert tracker._limit_block("base", -1, now=0.1) == "base would reach its limit"
+    # A fresh reading would block too, so there is nothing to ask Operator for.
+    assert operator.reading_requests == 0
 
 
 def test_arm_without_telemetry_is_not_limited():
@@ -127,6 +143,7 @@ def test_motion_on_a_stale_reading_stops_after_a_second_until_a_fresh_one():
         tracker.service_motion(now=t)
     assert t - 5.0 == pytest.approx(UNANCHORED_MOTION_S - MODEL.lookahead_s, abs=0.02)
     assert "fresh joint reading" in tracker.last_thought
+    assert operator.reading_requests == 1
     # Still blocked until a new reading lands, then anchored to it.
     assert tracker._limit_block("base", 1, now=t + 0.3)
     operator.telemetry = reading(t + 0.7, base=0)

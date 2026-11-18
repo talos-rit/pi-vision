@@ -23,7 +23,7 @@ try:
 except ImportError:
     from detector import Detection
     from operator_client import OperatorClient
-    from travel_budget import DEFAULT_TRAVEL_MODEL, TravelEstimator, TravelModel, reaches_limit
+    from travel_budget import DEFAULT_TRAVEL_MODEL, TravelEstimator, TravelModel, fresh_count_range, reaches_limit
     from vertical_axes import select_vertical_motion
 
 
@@ -109,6 +109,7 @@ class TrackingController:
         self.speed_percent = max(1, min(100, speed_percent))
         self.continuous_tracking = continuous_tracking
         self.travel = TravelEstimator(travel_model or DEFAULT_TRAVEL_MODEL, telemetry_timeout)
+        self._reading_requested_for: Optional[float] = None
         # Per-axis SPEED caps, e.g. {"elbow": 30, "pitch": 20}. Lifting the elbow
         # from rest at SPEED >= 50 trips IMPACT PROTECTION, and pitch turns 2-6x
         # faster than base in degrees at the same SPEED, so it overshoots.
@@ -674,6 +675,9 @@ class TrackingController:
         without telemetry is not limited. If the newest reading was already stale
         when motion began, the arm may move for UNANCHORED_MOTION_S; the stop that
         follows lets Operator take a fresh reading.
+
+        When only that uncertainty blocks the move (a fresh reading would not),
+        Operator is asked to poll right away instead of after its quiet window.
         """
         limits = self._axis_limits(axis)
         if limits is None or not direction:
@@ -682,12 +686,24 @@ class TrackingController:
         since = self.travel.unanchored_since(telemetry, now)
         if since is not None:
             if now + self.travel.model.lookahead_s - since >= UNANCHORED_MOTION_S:
+                self._request_reading(telemetry)
                 return "waiting for a fresh joint reading"
             return None
-        count_range = self.travel.count_range(axis, telemetry, now, self._axis_speed(axis), planned=direction)
-        if count_range is not None and reaches_limit(self.travel.model, axis, direction, count_range, limits):
+        model, speed = self.travel.model, self._axis_speed(axis)
+        count_range = self.travel.count_range(axis, telemetry, now, speed, planned=direction)
+        if count_range is None or not reaches_limit(model, axis, direction, count_range, limits):
+            return None
+        count = float(getattr(telemetry, "wrist_pitch" if axis == "pitch" else axis))
+        if reaches_limit(model, axis, direction, fresh_count_range(model, axis, count, speed), limits):
             return f"{axis} would reach its limit"
-        return None
+        self._request_reading(telemetry)
+        return f"{axis} may be near its limit; waiting for a fresh joint reading"
+
+    def _request_reading(self, telemetry) -> None:
+        # Once per reading: the request stays pending in Operator until it polls.
+        if self._reading_requested_for != telemetry.last_updated_monotonic:
+            self._reading_requested_for = telemetry.last_updated_monotonic
+            self.operator.request_telemetry()
 
     def _limit_status(self, status: ControllerStatus, reason: str) -> ControllerStatus:
         self.state = TrackingState.LIMIT_REACHED

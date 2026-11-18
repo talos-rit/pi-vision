@@ -128,6 +128,13 @@ class TravelEstimator:
         return low, high
 
 
+def fresh_count_range(model: TravelModel, axis: str, count: float,
+                      speed_percent: int) -> Tuple[float, float]:
+    """Bound for a move starting now from an up-to-date reading of `count`."""
+    reach = model.settle_counts + model.rate(axis, speed_percent) * (model.lookahead_s + model.coast_s)
+    return count - reach, count + reach
+
+
 def reaches_limit(model: TravelModel, axis: str, direction: int,
                   count_range: Tuple[float, float], limits: Tuple[int, int]) -> bool:
     """True when moving `axis` in `direction` could reach either relevant limit."""
