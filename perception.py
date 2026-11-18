@@ -12,6 +12,8 @@ class PerceptionStore:
         self.enabled = True
         self.session_id = uuid.uuid4().hex
         self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
+        self._version = 0
         self._sample = None
         self._last_publish = None
         self._fps = 0.0
@@ -20,6 +22,7 @@ class PerceptionStore:
         with self._lock:
             self.enabled = enabled
             self._sample = None
+            self._bump()
         return {"enabled": enabled}
 
     def publish(self, sample, detections, inference_s, *, pose_captured=None, motion_compensated=False):
@@ -43,6 +46,21 @@ class PerceptionStore:
                                 "aim_point": d.center, "keypoints": d.keypoints}
                                for d in detections],
             }
+            self._bump()
+
+    def _bump(self):
+        """Wake stream readers. Caller holds the lock."""
+        self._version += 1
+        self._changed.notify_all()
+
+    def wait_for_change(self, seen_version, timeout):
+        """Block until the store differs from `seen_version`, or `timeout` passes.
+
+        Returns the current version either way, so a timeout doubles as a heartbeat.
+        """
+        with self._changed:
+            self._changed.wait_for(lambda: self._version != seen_version, timeout)
+            return self._version
 
     def snapshot(self):
         with self._lock:
