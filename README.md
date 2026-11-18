@@ -16,6 +16,9 @@ Integrated endpoints:
 
 - `GET /api/v1/observations`: latest frame sequence, session ID, dimensions, bounding
   boxes, torso aim points, keypoints, inference duration and producer-relative age.
+- `GET /api/v1/observations/stream`: the same payload as server-sent events, sent as
+  soon as each inference finishes (or a pause), plus a 1 s heartbeat. Commander uses
+  this and falls back to polling the JSON endpoint on a PiVision without it.
 - `PUT /api/v1/perception`: `{"enabled": false}` pauses inference and revokes control.
 - `GET /api/v1/control/status`: current owner, lease, Operator connection and feedback.
 - `PUT /api/v1/control/lease`: explicit arming/release with an owner token; renewals

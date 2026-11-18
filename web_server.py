@@ -3,11 +3,13 @@ Web server and API for Pi Edge Tracker.
 Provides MJPEG annotated video feed, REST API, and a super simple Web UI showing what the Pi is doing/thinking.
 """
 
+import json
 import time
 from typing import Generator
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 
@@ -57,6 +59,23 @@ def apply_vertical_axes(controller, payload):
         kwargs[flag] = True
     if kwargs:
         controller.set_vertical_axes(**kwargs)
+
+
+def observation_events(perception, heartbeat_s=1.0):
+    """Server-sent events: one observation snapshot per change, else one per heartbeat.
+
+    A sync generator, so Starlette runs each wait in its threadpool rather than
+    blocking the event loop. Heartbeats keep `age_s` fresh and let the client's
+    read timeout detect a dead stream.
+    """
+    version = None
+    while True:
+        version = perception.wait_for_change(version, heartbeat_s)
+        try:
+            data = json.dumps(jsonable_encoder(perception.snapshot()), allow_nan=False, separators=(",", ":"))
+        except ValueError:
+            continue  # Non-finite value; the JSON endpoint would 500 on it too.
+        yield f"data: {data}\n\n"
 
 
 def create_app(
@@ -235,6 +254,13 @@ def create_app(
         if perception is None:
             raise HTTPException(status_code=503, detail="perception not initialized")
         return perception.snapshot()
+
+    @app.get("/api/v1/observations/stream")
+    def observation_stream():
+        if perception is None:
+            raise HTTPException(status_code=503, detail="perception not initialized")
+        return StreamingResponse(observation_events(perception), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.put("/api/v1/perception")
     def set_perception(payload: dict):
