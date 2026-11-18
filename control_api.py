@@ -45,17 +45,24 @@ class ControlLease:
             self.controller.set_enabled(False)
             self.owner, self.deadline = None, 0.0
 
-    def tune(self, owner, acceptable_ratio):
+    def tune(self, owner, acceptable_ratio=None, speed_percent=None):
         if not isinstance(owner, str) or not 8 <= len(owner) <= 128:
             raise HTTPException(422, "expected Commander owner token")
+        if acceptable_ratio is None and speed_percent is None:
+            raise HTTPException(422, "expected acceptable_ratio or speed_percent")
         with self._lock:
             self.service()
             if self.owner is not None and self.owner != owner:
                 raise HTTPException(409, "another Commander owns autonomous control")
             try:
-                self.controller.set_acceptable_ratio(acceptable_ratio)
+                if acceptable_ratio is not None:
+                    self.controller.set_acceptable_ratio(acceptable_ratio)
+                if speed_percent is not None:
+                    self.controller.set_speed_percent(speed_percent)
             except ValueError as error:
                 raise HTTPException(422, str(error)) from error
+            except RuntimeError as error:
+                raise HTTPException(503, str(error)) from error
             return self.status()
 
     def status(self):
@@ -66,6 +73,7 @@ class ControlLease:
                     "state": getattr(getattr(self.controller, "state", None), "value", None),
                     "last_thought": self.controller.last_thought,
                     "acceptable_ratio": getattr(self.controller, "acceptable_ratio", .25),
+                    "speed_percent": getattr(self.controller, "speed_percent", None),
                     "lease_remaining_s": max(0, self.deadline - self.clock()),
                     "controller_profile": getattr(self.operator, "get_controller_profile", lambda: None)(),
                     "operator_connected": self.operator.is_connected,
